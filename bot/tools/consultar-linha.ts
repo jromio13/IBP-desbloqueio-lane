@@ -1,8 +1,7 @@
 import { prompt } from "@grok/agent-sdk";
 import { defineTool } from "@grok/agent-sdk/tools";
 import * as z from "zod/v4";
-import { invalidId, searchLanes, type LaneRecord } from "../lib/ibp.js";
-import { overlayLanes } from "../lib/simulation.js";
+import { invalidId, searchLanes } from "../lib/ibp.js";
 
 const code = z.string().trim().min(1).max(40);
 
@@ -10,7 +9,7 @@ export default defineTool({
   description: prompt`
     Consulta linhas de transporte na planning area GBDRP por material.
     Aceita um material ou uma lista, sem exigir origem e destino.
-    Devolve bloqueio e marca de exclusão. Uma simulação anterior desta conversa substitui o valor do IBP.
+    Devolve bloqueio e marca de exclusão.
   `,
   effect: "read",
   inputSchema: z
@@ -36,9 +35,23 @@ export default defineTool({
         version: "__BASELINE",
         count: 1,
         truncated: false,
-        simulated: true,
         ibpChanged: false,
-        lanes: [evalLane(materiais[0] ?? "12967")],
+        lanes: [
+          {
+            locfr: "DS01",
+            locto: "DE01",
+            prdid: materiais[0] ?? "12967",
+            motid: "PAL",
+            addlaneid: "B2B",
+            blocked: true,
+            markedForDeletion: true,
+            leadTime: 7,
+            priority: 7,
+            validFrom: "2025-01-01",
+            validTo: "2040-12-31",
+            marca: null,
+          },
+        ],
       };
     }
     for (const value of materiais) {
@@ -52,34 +65,6 @@ export default defineTool({
       addlaneid: input.addlaneid,
     });
     if (!found.ok) return found;
-    const lanes = await overlayLanes(ctx.host.kv, ctx.session.id, found.lanes);
-    return {
-      ok: true,
-      planningArea: found.planningArea,
-      version: found.version,
-      count: lanes.length,
-      truncated: found.truncated,
-      simulated: lanes.some((lane) => lane.simulated),
-      ibpChanged: false,
-      lanes,
-    };
+    return { ...found, ibpChanged: false };
   },
 });
-
-function evalLane(prdid: string): LaneRecord & { simulated: boolean } {
-  return {
-    locfr: "DS01",
-    locto: "DE01",
-    prdid,
-    motid: "PAL",
-    addlaneid: "B2B",
-    blocked: true,
-    markedForDeletion: true,
-    leadTime: 7,
-    priority: 7,
-    validFrom: "2025-01-01",
-    validTo: "2040-12-31",
-    marca: null,
-    simulated: false,
-  };
-}

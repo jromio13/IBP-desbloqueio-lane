@@ -7,7 +7,6 @@ export default defineEval({
     await t.send("Consulta as linhas do material 12967. Só mostre a tabela.");
     t.succeeded();
     t.calledTool("consultar-linha");
-    t.notCalledTool("propor-simulacao");
-    t.notCalledTool("confirmar-simulacao");
+    t.notCalledTool("atender-solicitacao");
   },
 });

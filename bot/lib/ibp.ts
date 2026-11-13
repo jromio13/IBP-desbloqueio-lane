@@ -152,65 +152,99 @@ export async function findLane(
   return { ok: true, lane: found.lanes[0] ?? null };
 }
 
-// Clears only TLANEBLOCKEDFORPLANNING. Repeating the call on an open lane
+export type LaneAction = "bloquear" | "desbloquear";
+
+// Sets both planning block and deletion mark. A repeat with the same result
 // does not post again.
-export async function unblockLane(
-  key: LaneKey,
-): Promise<{ ok: true; lane: LaneRecord; messages: string[] } | IbpFailure> {
-  for (const value of Object.values(key)) {
-    if (invalidId(value)) return { ok: false, error: "invalid_id" };
-  }
-  const current = await findLane(key);
-  if (!current.ok) return current;
-  if (current.lane === null) return { ok: false, error: "not_found" };
-  if (!current.lane.blocked) {
-    return { ok: true, lane: current.lane, messages: [] };
+export async function applyLaneFlags(
+  keys: LaneKey[],
+  action: LaneAction,
+): Promise<
+  | {
+      ok: true;
+      changed: number;
+      ibpChanged: boolean;
+      messages: string[];
+      planningArea: string;
+      version: string;
+      truncated: boolean;
+      lanes: LaneRecord[];
+    }
+  | IbpFailure
+> {
+  const mark = action === "bloquear";
+  const pending: LaneKey[] = [];
+  for (const key of keys) {
+    if (Object.values(key).some(invalidId)) return { ok: false, error: "invalid_id" };
+    const current = await findLane(key);
+    if (!current.ok) return current;
+    if (current.lane === null) return { ok: false, error: "not_found", detail: key.prdid };
+    if (current.lane.blocked !== mark || current.lane.markedForDeletion !== mark) {
+      pending.push(key);
+    }
   }
 
-  const config = ibpConfig();
-  if ("error" in config) return config;
-  const session = await openWriteSession(config);
-  if (!session.ok) return session;
+  let messages: string[] = [];
+  if (pending.length > 0) {
+    const config = ibpConfig();
+    if ("error" in config) return config;
+    const session = await openWriteSession(config);
+    if (!session.ok) return session;
+    const flag = mark ? "X" : "";
+    const posted = await ibpSend(config, `${config.baseUrl}/DRPTLANETrans`, {
+      method: "POST",
+      body: JSON.stringify({
+        TransactionID: session.transactionId,
+        PlanningAreaID: config.planningArea,
+        VersionID: config.version,
+        DoCommit: true,
+        DeleteEntries: false,
+        RequestedAttributes:
+          "LOCTO,LOCFR,PRDID,ADDLANEID,MOTID,TLANEBLOCKEDFORPLANNING,TLANEDEL",
+        NavDRPTLANE: pending.map((key) => ({
+          LOCTO: key.locto,
+          LOCFR: key.locfr,
+          PRDID: key.prdid,
+          ADDLANEID: key.addlaneid,
+          MOTID: key.motid,
+          TLANEBLOCKEDFORPLANNING: flag,
+          TLANEDEL: flag,
+        })),
+      }),
+      csrf: session.csrf,
+      cookie: session.cookie,
+    });
+    if (!posted.ok) return posted;
+    messages = await readMessages(config, session, session.transactionId);
+    for (const key of pending) {
+      const after = await findLane(key);
+      if (!after.ok) return after;
+      if (
+        after.lane === null ||
+        after.lane.blocked !== mark ||
+        after.lane.markedForDeletion !== mark
+      ) {
+        return {
+          ok: false,
+          error: "not_applied",
+          detail: messages.join(" ").slice(0, 300),
+        };
+      }
+    }
+  }
 
-  const body = {
-    TransactionID: session.transactionId,
-    PlanningAreaID: config.planningArea,
-    VersionID: config.version,
-    DoCommit: true,
-    DeleteEntries: false,
-    RequestedAttributes:
-      "LOCTO,LOCFR,PRDID,ADDLANEID,MOTID,TLANEBLOCKEDFORPLANNING",
-    NavDRPTLANE: [
-      {
-        LOCTO: key.locto,
-        LOCFR: key.locfr,
-        PRDID: key.prdid,
-        ADDLANEID: key.addlaneid,
-        MOTID: key.motid,
-        TLANEBLOCKEDFORPLANNING: "",
-      },
-    ],
+  const listed = await searchLanes({ prdids: [...new Set(keys.map((key) => key.prdid))] });
+  if (!listed.ok) return listed;
+  return {
+    ok: true,
+    changed: pending.length,
+    ibpChanged: pending.length > 0,
+    messages,
+    planningArea: listed.planningArea,
+    version: listed.version,
+    truncated: listed.truncated,
+    lanes: listed.lanes,
   };
-  const posted = await ibpSend(config, `${config.baseUrl}/DRPTLANETrans`, {
-    method: "POST",
-    body: JSON.stringify(body),
-    csrf: session.csrf,
-    cookie: session.cookie,
-  });
-  if (!posted.ok) return posted;
-
-  const messages = await readMessages(config, session, session.transactionId);
-  const after = await findLane(key);
-  if (!after.ok) return after;
-  if (after.lane === null) return { ok: false, error: "not_found", detail: messages.join(" ") };
-  if (after.lane.blocked) {
-    return {
-      ok: false,
-      error: "still_blocked",
-      detail: messages.join(" ").slice(0, 300),
-    };
-  }
-  return { ok: true, lane: after.lane, messages };
 }
 
 function odataQuote(value: string): string {
