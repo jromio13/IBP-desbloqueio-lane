@@ -33,6 +33,7 @@ export type LaneQuery = {
   locfr?: string;
   locto?: string;
   prdid?: string;
+  prdids?: string[];
   motid?: string;
   addlaneid?: string;
 };
@@ -63,7 +64,7 @@ export type IbpFailure = {
 };
 
 const ID_PATTERN = /^[A-Za-z0-9._/-]+$/;
-const LIMIT = 20;
+const LIMIT = 40;
 
 type Config = {
   baseUrl: string;
@@ -105,7 +106,6 @@ export async function searchLanes(
   const fields: Array<[string, string | undefined]> = [
     ["LOCFR", query.locfr],
     ["LOCTO", query.locto],
-    ["PRDID", query.prdid],
     ["MOTID", query.motid],
     ["ADDLANEID", query.addlaneid],
   ];
@@ -113,6 +113,18 @@ export async function searchLanes(
     if (value === undefined || value === "") continue;
     if (invalidId(value)) return { ok: false, error: "invalid_id", detail: field };
     filters.push(`${field} eq '${odataQuote(value)}'`);
+  }
+  const materials = [
+    ...new Set(
+      [...(query.prdids ?? []), ...(query.prdid ? [query.prdid] : [])].filter((id) => id !== ""),
+    ),
+  ];
+  if (materials.length > 0) {
+    for (const id of materials) {
+      if (invalidId(id)) return { ok: false, error: "invalid_id", detail: "PRDID" };
+    }
+    const clauses = materials.map((id) => `PRDID eq '${odataQuote(id)}'`);
+    filters.push(clauses.length === 1 ? clauses[0] : `(${clauses.join(" or ")})`);
   }
   if (filters.length === 2) return { ok: false, error: "missing_key" };
 
