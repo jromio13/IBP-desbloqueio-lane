@@ -16,6 +16,7 @@ export default defineTool({
     Atender a solicitação.
     Grava no IBP o bloqueio para planejamento e a marca de exclusão das linhas escolhidas.
     Bloquear marca os dois. Desbloquear limpa os dois.
+    A versão __BASELINE não aceita gravação. A gravação vai para as versões de planejamento que já têm a linha.
     Só executa depois que a pessoa clicar em aprovar.
   `,
   effect: "idempotent",

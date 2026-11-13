@@ -46,6 +46,7 @@ export type LaneRecord = LaneKey & {
   validFrom: string | null;
   validTo: string | null;
   marca: string | null;
+  version?: string;
 };
 
 export type LaneSearchResult = {
@@ -154,8 +155,18 @@ export async function findLane(
 
 export type LaneAction = "bloquear" | "desbloquear";
 
-// Sets both planning block and deletion mark. A repeat with the same result
-// does not post again.
+type RawRow = Record<string, unknown>;
+
+const WRITE_OMIT = new Set([
+  "__metadata",
+  "PlanningAreaID",
+  "VersionID",
+  "CREATEDDATE",
+  "LASTMODIFIEDDATE",
+]);
+
+// __BASELINE is valid on read and rejected on DRPTLANETrans. A write has to
+// target a planning version and send the stored attributes, not only the keys.
 export async function applyLaneFlags(
   keys: LaneKey[],
   action: LaneAction,
@@ -164,87 +175,284 @@ export async function applyLaneFlags(
       ok: true;
       changed: number;
       ibpChanged: boolean;
+      baselineWritable: false;
       messages: string[];
       planningArea: string;
       version: string;
+      versions: string[];
       truncated: boolean;
       lanes: LaneRecord[];
+      atualizadas: LaneRecord[];
     }
   | IbpFailure
 > {
+  const config = ibpConfig();
+  if ("error" in config) return config;
   const mark = action === "bloquear";
-  const pending: LaneKey[] = [];
   for (const key of keys) {
     if (Object.values(key).some(invalidId)) return { ok: false, error: "invalid_id" };
     const current = await findLane(key);
     if (!current.ok) return current;
     if (current.lane === null) return { ok: false, error: "not_found", detail: key.prdid };
-    if (current.lane.blocked !== mark || current.lane.markedForDeletion !== mark) {
-      pending.push(key);
-    }
   }
 
-  let messages: string[] = [];
-  if (pending.length > 0) {
-    const config = ibpConfig();
-    if ("error" in config) return config;
-    const session = await openWriteSession(config);
-    if (!session.ok) return session;
-    const flag = mark ? "X" : "";
-    const posted = await ibpSend(config, `${config.baseUrl}/DRPTLANETrans`, {
-      method: "POST",
-      body: JSON.stringify({
-        TransactionID: session.transactionId,
-        PlanningAreaID: config.planningArea,
-        VersionID: config.version,
-        DoCommit: true,
-        DeleteEntries: false,
-        RequestedAttributes:
-          "LOCTO,LOCFR,PRDID,ADDLANEID,MOTID,TLANEBLOCKEDFORPLANNING,TLANEDEL",
-        NavDRPTLANE: pending.map((key) => ({
-          LOCTO: key.locto,
-          LOCFR: key.locfr,
-          PRDID: key.prdid,
-          ADDLANEID: key.addlaneid,
-          MOTID: key.motid,
-          TLANEBLOCKEDFORPLANNING: flag,
-          TLANEDEL: flag,
-        })),
-      }),
-      csrf: session.csrf,
-      cookie: session.cookie,
-    });
-    if (!posted.ok) return posted;
-    messages = await readMessages(config, session, session.transactionId);
-    for (const key of pending) {
-      const after = await findLane(key);
-      if (!after.ok) return after;
-      if (
-        after.lane === null ||
-        after.lane.blocked !== mark ||
-        after.lane.markedForDeletion !== mark
-      ) {
-        return {
-          ok: false,
-          error: "not_applied",
-          detail: messages.join(" ").slice(0, 300),
-        };
-      }
+  const discovered = await planningVersions(config);
+  if ("error" in discovered) return discovered;
+  const versions = discovered.versions;
+
+  const jobs: WriteJob[] = [];
+  let changed = 0;
+  let foundInPlanningVersion = false;
+  for (const version of versions) {
+    const rows = await fetchVersionRows(config, version, keys);
+    if (!rows.ok) return rows;
+    const items: Record<string, unknown>[] = [];
+    for (const key of keys) {
+      const row = rows.rows.find((candidate) => sameLane(candidate, key));
+      if (row === undefined) continue;
+      foundInPlanningVersion = true;
+      const lane = toLane(row);
+      if (lane.blocked === mark && lane.markedForDeletion === mark) continue;
+      items.push(laneWriteItem(row, mark ? "X" : ""));
     }
+    if (items.length === 0) continue;
+    const posted = await postVersion(config, version, items);
+    if (!posted.ok) return posted;
+    jobs.push(...posted.jobs);
+    changed += items.length;
   }
+
+  if (!foundInPlanningVersion) {
+    return {
+      ok: false,
+      error: "not_in_planning_version",
+      detail:
+        "A linha está na versão __BASELINE, e o IBP não aceita gravação nessa versão. Nenhuma versão de planejamento tem essa linha.",
+    };
+  }
+
+  const messages: string[] = [];
+  const waited = await Promise.all(
+    jobs.map(async (job) => {
+      const done = await waitUntilProcessed(config, job.session, job.transactionId);
+      if (!done.ok) return done;
+      const texts = await readMessages(config, job.session, job.transactionId);
+      return { ok: true as const, texts };
+    }),
+  );
+  for (const result of waited) {
+    if (!result.ok) return result;
+    messages.push(...result.texts);
+  }
+
+  const confirmed = await confirmVersionFlags(config, versions, keys, mark);
+  if (!confirmed.ok) return confirmed;
 
   const listed = await searchLanes({ prdids: [...new Set(keys.map((key) => key.prdid))] });
   if (!listed.ok) return listed;
   return {
     ok: true,
-    changed: pending.length,
-    ibpChanged: pending.length > 0,
-    messages,
+    changed,
+    ibpChanged: changed > 0,
+    baselineWritable: false,
+    messages: messages.filter((text) => text !== "").slice(0, 5),
     planningArea: listed.planningArea,
     version: listed.version,
+    versions: [...new Set(confirmed.lanes.map((lane) => lane.version ?? ""))].filter(
+      (version) => version !== "",
+    ),
     truncated: listed.truncated,
-    lanes: listed.lanes,
+    lanes: listed.lanes.map((lane) => ({ ...lane, version: listed.version })),
+    atualizadas: confirmed.lanes,
   };
+}
+
+function laneWriteItem(row: RawRow, flag: string): Record<string, unknown> {
+  const item: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (WRITE_OMIT.has(key) || value == null) continue;
+    item[key] = value;
+  }
+  item.TLANEBLOCKEDFORPLANNING = flag;
+  item.TLANEDEL = flag;
+  return item;
+}
+
+async function planningVersions(config: Config): Promise<{ ok: true; versions: string[] } | IbpFailure> {
+  const override = process.env.IBP_WRITE_VERSIONS?.trim() ?? "";
+  if (override !== "") {
+    const versions = override
+      .split(",")
+      .map((version) => version.trim())
+      .filter((version) => version !== "");
+    if (versions.length === 0) return { ok: false, error: "ibp_no_write_version" };
+    if (versions.some((version) => version === "__BASELINE" || invalidId(version))) {
+      return {
+        ok: false,
+        error: "invalid_id",
+        detail: "IBP_WRITE_VERSIONS não pode usar __BASELINE.",
+      };
+    }
+    return { ok: true, versions };
+  }
+
+  const filter = `PlanningAreaID eq '${odataQuote(config.planningArea)}' and MasterDataTypeID eq 'DRPTLANE'`;
+  const url = `${config.baseUrl}/VersionSpecificMasterDataTypes?$format=json&$top=100&$filter=${encodeURIComponent(filter)}`;
+  const response = await ibpGet(config, url);
+  if (!response.ok) return response;
+  const versions = [
+    ...new Set(
+      odataRows(response.body)
+        .map((row) => asString(row.VersionID))
+        .filter((version) => version !== "" && version !== "__BASELINE" && !invalidId(version)),
+    ),
+  ];
+  if (versions.length === 0) return { ok: false, error: "ibp_no_write_version" };
+  return { ok: true, versions };
+}
+
+async function fetchVersionRows(
+  config: Config,
+  version: string,
+  keys: LaneKey[],
+): Promise<{ ok: true; rows: RawRow[] } | IbpFailure> {
+  const rows: RawRow[] = [];
+  for (let index = 0; index < keys.length; index += 8) {
+    const clauses = keys.slice(index, index + 8).map(
+      (key) =>
+        `(LOCFR eq '${odataQuote(key.locfr)}' and LOCTO eq '${odataQuote(key.locto)}' and PRDID eq '${odataQuote(key.prdid)}' and MOTID eq '${odataQuote(key.motid)}' and ADDLANEID eq '${odataQuote(key.addlaneid)}')`,
+    );
+    const filter = `PlanningAreaID eq '${odataQuote(config.planningArea)}' and VersionID eq '${odataQuote(version)}' and (${clauses.join(" or ")})`;
+    const url = `${config.baseUrl}/DRPTLANE?$format=json&$top=100&$filter=${encodeURIComponent(filter)}`;
+    const response = await ibpGet(config, url);
+    if (!response.ok) return response;
+    rows.push(...odataRows(response.body));
+  }
+  return { ok: true, rows };
+}
+
+function sameLane(row: RawRow, key: LaneKey): boolean {
+  return (
+    asString(row.LOCFR) === key.locfr &&
+    asString(row.LOCTO) === key.locto &&
+    asString(row.PRDID) === key.prdid &&
+    asString(row.MOTID) === key.motid &&
+    asString(row.ADDLANEID) === key.addlaneid
+  );
+}
+
+type WriteJob = {
+  session: WriteSession;
+  transactionId: string;
+};
+
+async function postVersion(
+  config: Config,
+  version: string,
+  items: Record<string, unknown>[],
+): Promise<{ ok: true; jobs: WriteJob[] } | IbpFailure> {
+  const posted = await postOnce(config, version, items);
+  if (posted.ok) return { ok: true, jobs: [posted.job] };
+  if (items.length === 1) return posted;
+  const jobs: WriteJob[] = [];
+  for (const item of items) {
+    const single = await postOnce(config, version, [item]);
+    if (!single.ok) return single;
+    jobs.push(single.job);
+  }
+  return { ok: true, jobs };
+}
+
+async function postOnce(
+  config: Config,
+  version: string,
+  items: Record<string, unknown>[],
+): Promise<{ ok: true; job: WriteJob } | IbpFailure> {
+  const session = await openWriteSession(config);
+  if (!session.ok) return session;
+  const attributes = [...new Set(items.flatMap((item) => Object.keys(item)))];
+  const posted = await ibpSend(config, `${config.baseUrl}/DRPTLANETrans`, {
+    method: "POST",
+    body: JSON.stringify({
+      TransactionID: session.transactionId,
+      PlanningAreaID: config.planningArea,
+      VersionID: version,
+      DoCommit: true,
+      DeleteEntries: false,
+      RequestedAttributes: attributes.join(","),
+      NavDRPTLANE: items,
+    }),
+    csrf: session.csrf,
+    cookie: session.cookie,
+  });
+  if (!posted.ok) return posted;
+  return { ok: true, job: { session, transactionId: session.transactionId } };
+}
+
+async function waitUntilProcessed(
+  config: Config,
+  session: WriteSession,
+  transactionId: string,
+): Promise<{ ok: true } | IbpFailure> {
+  const url = `${config.baseUrl}/GetExportResult?P_TransactionID='${transactionId}'&$format=json`;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await ibpSend(config, url, {
+      method: "GET",
+      csrf: session.csrf,
+      cookie: session.cookie,
+    });
+    if (!response.ok) {
+      const detail = response.detail ?? "";
+      if (/not finished|processing/i.test(detail)) {
+        await delay(2000);
+        continue;
+      }
+      return response;
+    }
+    const status = exportValue(response.body, "Status");
+    if (status === "PROCESSED") return { ok: true };
+    if (status !== "PROCESSING" && status !== "INITIAL" && status !== "") {
+      return { ok: false, error: "ibp_http_error", detail: status.slice(0, 300) };
+    }
+    await delay(2000);
+  }
+  return { ok: false, error: "ibp_timeout", detail: transactionId };
+}
+
+async function confirmVersionFlags(
+  config: Config,
+  versions: string[],
+  keys: LaneKey[],
+  mark: boolean,
+): Promise<{ ok: true; lanes: LaneRecord[] } | IbpFailure> {
+  let latest: LaneRecord[] = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    latest = [];
+    let pending = false;
+    for (const version of versions) {
+      const rows = await fetchVersionRows(config, version, keys);
+      if (!rows.ok) return rows;
+      for (const key of keys) {
+        const row = rows.rows.find((candidate) => sameLane(candidate, key));
+        if (row === undefined) continue;
+        const lane = { ...toLane(row), version };
+        if (lane.blocked !== mark || lane.markedForDeletion !== mark) pending = true;
+        latest.push(lane);
+      }
+    }
+    if (!pending) return { ok: true, lanes: latest };
+    await delay(2000);
+  }
+  return { ok: false, error: "not_applied" };
+}
+
+function exportValue(body: unknown, name: string): string {
+  const row = odataRows(body).find((candidate) => asString(candidate.Name) === name);
+  return row === undefined ? "" : asString(row.Value);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function odataQuote(value: string): string {
