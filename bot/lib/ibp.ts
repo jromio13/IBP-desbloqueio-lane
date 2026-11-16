@@ -165,8 +165,10 @@ const WRITE_OMIT = new Set([
   "LASTMODIFIEDDATE",
 ]);
 
-// __BASELINE is valid on read and rejected on DRPTLANETrans. A write has to
-// target a planning version and send the stored attributes, not only the keys.
+// __BASELINE is valid on read and rejected on DRPTLANETrans.
+// The maintained copy is INPUTDADOS (input manual). A missing lane is created
+// there from the baseline row; an existing lane keeps its other attributes.
+const MANUAL_INPUT_VERSION = "INPUTDADOS";
 export async function applyLaneFlags(
   keys: LaneKey[],
   action: LaneAction,
@@ -196,39 +198,35 @@ export async function applyLaneFlags(
     if (current.lane === null) return { ok: false, error: "not_found", detail: key.prdid };
   }
 
-  const discovered = await planningVersions(config);
+  const discovered = planningVersions();
   if ("error" in discovered) return discovered;
   const versions = discovered.versions;
+  const baseline = await fetchVersionRows(config, config.version, keys);
+  if (!baseline.ok) return baseline;
 
   const jobs: WriteJob[] = [];
   let changed = 0;
-  let foundInPlanningVersion = false;
   for (const version of versions) {
-    const rows = await fetchVersionRows(config, version, keys);
-    if (!rows.ok) return rows;
+    const existing = await fetchVersionRows(config, version, keys);
+    if (!existing.ok) return existing;
     const items: Record<string, unknown>[] = [];
     for (const key of keys) {
-      const row = rows.rows.find((candidate) => sameLane(candidate, key));
-      if (row === undefined) continue;
-      foundInPlanningVersion = true;
-      const lane = toLane(row);
-      if (lane.blocked === mark && lane.markedForDeletion === mark) continue;
-      items.push(laneWriteItem(row, mark ? "X" : ""));
+      const current = existing.rows.find((candidate) => sameLane(candidate, key));
+      if (current !== undefined) {
+        const lane = toLane(current);
+        if (lane.blocked === mark && lane.markedForDeletion === mark) continue;
+        items.push(laneWriteItem(current, mark ? "X" : ""));
+        continue;
+      }
+      const source = baseline.rows.find((candidate) => sameLane(candidate, key));
+      if (source === undefined) return { ok: false, error: "not_found", detail: key.prdid };
+      items.push(laneWriteItem(source, mark ? "X" : ""));
     }
     if (items.length === 0) continue;
     const posted = await postVersion(config, version, items);
     if (!posted.ok) return posted;
     jobs.push(...posted.jobs);
     changed += items.length;
-  }
-
-  if (!foundInPlanningVersion) {
-    return {
-      ok: false,
-      error: "not_in_planning_version",
-      detail:
-        "A linha está na versão __BASELINE, e o IBP não aceita gravação nessa versão. Nenhuma versão de planejamento tem essa linha.",
-    };
   }
 
   const messages: string[] = [];
@@ -278,36 +276,21 @@ function laneWriteItem(row: RawRow, flag: string): Record<string, unknown> {
   return item;
 }
 
-async function planningVersions(config: Config): Promise<{ ok: true; versions: string[] } | IbpFailure> {
+function planningVersions(): { ok: true; versions: string[] } | IbpFailure {
   const override = process.env.IBP_WRITE_VERSIONS?.trim() ?? "";
-  if (override !== "") {
-    const versions = override
-      .split(",")
-      .map((version) => version.trim())
-      .filter((version) => version !== "");
-    if (versions.length === 0) return { ok: false, error: "ibp_no_write_version" };
-    if (versions.some((version) => version === "__BASELINE" || invalidId(version))) {
-      return {
-        ok: false,
-        error: "invalid_id",
-        detail: "IBP_WRITE_VERSIONS não pode usar __BASELINE.",
-      };
-    }
-    return { ok: true, versions };
-  }
-
-  const filter = `PlanningAreaID eq '${odataQuote(config.planningArea)}' and MasterDataTypeID eq 'DRPTLANE'`;
-  const url = `${config.baseUrl}/VersionSpecificMasterDataTypes?$format=json&$top=100&$filter=${encodeURIComponent(filter)}`;
-  const response = await ibpGet(config, url);
-  if (!response.ok) return response;
-  const versions = [
-    ...new Set(
-      odataRows(response.body)
-        .map((row) => asString(row.VersionID))
-        .filter((version) => version !== "" && version !== "__BASELINE" && !invalidId(version)),
-    ),
-  ];
+  if (override === "") return { ok: true, versions: [MANUAL_INPUT_VERSION] };
+  const versions = override
+    .split(",")
+    .map((version) => version.trim())
+    .filter((version) => version !== "");
   if (versions.length === 0) return { ok: false, error: "ibp_no_write_version" };
+  if (versions.some((version) => version === "__BASELINE" || invalidId(version))) {
+    return {
+      ok: false,
+      error: "invalid_id",
+      detail: "IBP_WRITE_VERSIONS não pode usar __BASELINE.",
+    };
+  }
   return { ok: true, versions };
 }
 
@@ -434,7 +417,10 @@ async function confirmVersionFlags(
       if (!rows.ok) return rows;
       for (const key of keys) {
         const row = rows.rows.find((candidate) => sameLane(candidate, key));
-        if (row === undefined) continue;
+        if (row === undefined) {
+          pending = true;
+          continue;
+        }
         const lane = { ...toLane(row), version };
         if (lane.blocked !== mark || lane.markedForDeletion !== mark) pending = true;
         latest.push(lane);
