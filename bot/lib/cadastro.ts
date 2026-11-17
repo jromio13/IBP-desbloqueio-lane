@@ -20,6 +20,17 @@ export const CADASTRO_ENTITY = "DRPZTLANEOBP";
 const STANDARD_FROM = "1970-01-01";
 const STANDARD_TO = "9999-12-31";
 const LANE_IDS = new Set(["DPLY", "EQ", "CD_ARMEX"]);
+const KEY_FIELDS = [
+  "ZOBPCLASSIFDRP",
+  "ZIDADDLANE",
+  "ZMARCA",
+  "MOTID",
+  "PRDID",
+  "LOCTO",
+  "LOCFR",
+  "ZSUBMARCA",
+] as const;
+const KEY_FIELD_SET = new Set<string>(KEY_FIELDS);
 
 export type RouteAction = "bloquear" | "desbloquear";
 
@@ -267,7 +278,7 @@ export async function gravarSolicitacao(
     if (built.skip) continue;
     const session = await openWriteSession(config);
     if (!session.ok) return session;
-    const attributes = Object.keys(built.item);
+    const attributes = requestedAttributes(built.item);
     const posted = await ibpSend(config, `${config.baseUrl}/${model.transSet}`, {
       method: "POST",
       csrf: session.csrf,
@@ -278,7 +289,7 @@ export async function gravarSolicitacao(
         ...(model.sendVersion ? { VersionID: INPUT_VERSION } : {}),
         DoCommit: true,
         DeleteEntries: false,
-        RequestedAttributes: attributes.join(","),
+        RequestedAttributes: attributes,
         [model.nav]: [built.item],
       }),
     });
@@ -524,9 +535,24 @@ function fromExisting(
   if (route.addlane !== undefined) draft.addlane = canonicalCode(route.addlane);
   if (leadTime !== null) draft.leadTime = leadTime;
   if (route.marcarExclusao !== undefined) draft.markedForDeletion = route.marcarExclusao;
+  fillKeyDefaults(draft);
   draft.armex = draft.addlane === "CD_ARMEX";
   if (draft.validFrom === "") draft.validFrom = STANDARD_FROM;
   if (draft.validTo === "") draft.validTo = STANDARD_TO;
+  if (draft.addlane === "" || !LANE_IDS.has(draft.addlane)) {
+    return {
+      skip: true,
+      avisos,
+      item: {},
+      preview: {
+        ready: false,
+        operacao: "pendente",
+        missing: ["ID da lane (DPLY, EQ ou CD_ARMEX)"],
+        candidatos: [],
+        previa: previewFromDraft(draft, draft.justificativa),
+      },
+    };
+  }
   const item = itemFromDraft(model, row, draft);
   const skip = samePayload(model, row, item);
   return {
@@ -738,8 +764,30 @@ function itemFromDraft(model: Model, existing: RawRow | null, draft: Draft): Raw
   put(item, model, model.blocked, draft.blocked ? "X" : "");
   put(item, model, model.deletion, draft.markedForDeletion ? "X" : "");
   put(item, model, model.observacao, draft.justificativa);
+  item.LOCFR = draft.locfr;
+  item.LOCTO = draft.locto;
+  item.MOTID = draft.motid || "ALL";
+  item.PRDID = draft.prdid || "ALL";
+  item.ZMARCA = draft.marca || "ALL";
+  item.ZSUBMARCA = draft.submarca || "ALL";
+  item.ZOBPCLASSIFDRP = draft.classif || "ALL";
+  item.ZIDADDLANE = draft.addlane;
   if (model.rounding !== null) delete item[model.rounding];
   return item;
+}
+
+function fillKeyDefaults(draft: Draft): void {
+  if (draft.motid === "") draft.motid = "ALL";
+  if (draft.prdid === "") draft.prdid = "ALL";
+  if (draft.marca === "") draft.marca = "ALL";
+  if (draft.submarca === "") draft.submarca = "ALL";
+  if (draft.classif === "") draft.classif = "ALL";
+}
+
+function requestedAttributes(item: RawRow): string {
+  const keys = KEY_FIELDS.filter((name) => name in item);
+  const rest = Object.keys(item).filter((name) => !KEY_FIELD_SET.has(name));
+  return [...keys, ...rest].join(",");
 }
 
 function put(item: RawRow, model: Model, name: string | null, value: string | number): void {
@@ -871,7 +919,16 @@ async function readModel(config: Config): Promise<Model | IbpFailure> {
   const props = new Map(readProps(main).map((prop) => [prop.name, prop]));
   const writeProps = new Map(readProps(write).map((prop) => [prop.name, prop]));
   const transProps = new Map(readProps(trans).map((prop) => [prop.name, prop]));
-  const keys = readKeys(write).filter((key) => key !== "PlanningAreaID" && key !== "VersionID");
+  const keys = [
+    ...new Set([
+      ...KEY_FIELDS,
+      ...readKeys(main),
+      ...readKeys(write),
+    ]),
+  ].filter((key) => key !== "PlanningAreaID" && key !== "VersionID");
+  for (const name of KEY_FIELDS) {
+    if (!writeProps.has(name)) writeProps.set(name, { name, type: "Edm.String", nullable: false });
+  }
   const nav = trans.match(/<NavigationProperty Name="([^"]+)"/)?.[1] ?? "";
   const observacao = observationAttribute([...writeProps.values()]);
   if (nav === "" || observacao === null) {
@@ -903,14 +960,14 @@ async function readModel(config: Config): Promise<Model | IbpFailure> {
     versioned: props.has("PlanningAreaID") && props.has("VersionID"),
     sendVersion: transProps.has("VersionID"),
     sendPlanning: transProps.has("PlanningAreaID"),
-    locfr,
-    locto,
-    motid: pick(writeProps, ["MOTID"]),
-    prdid: pick(writeProps, ["PRDID"]),
-    marca: pick(writeProps, ["ZMARCA", "ZMARCAS"]),
-    submarca: pick(writeProps, ["ZSUBMARCA", "ZSUBMARCAS"]),
-    classif: pick(writeProps, ["ZOBPCLASSIFDRP"]),
-    addlane: pick(writeProps, ["ZIDADDLANE", "ADDLANEID"]),
+    locfr: "LOCFR",
+    locto: "LOCTO",
+    motid: "MOTID",
+    prdid: "PRDID",
+    marca: "ZMARCA",
+    submarca: "ZSUBMARCA",
+    classif: "ZOBPCLASSIFDRP",
+    addlane: "ZIDADDLANE",
     lead: pick(writeProps, ["ZOBPLEADTIMELANE", "LEADTIME"]),
     stock: pick(writeProps, ["STOCKTRANSFERTYPE"]),
     armex: pick(writeProps, ["ZARMEX"]),
