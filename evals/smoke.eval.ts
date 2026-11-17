@@ -2,11 +2,12 @@ import { defineEval } from "@grok/agent-sdk/evals";
 
 export default defineEval({
   tags: ["smoke"],
-  description: "A material lookup calls consultar-linha and does not simulate a change.",
+  description: "A route lookup calls consultar-linha and does not open a write.",
   async test(t) {
-    await t.send("Consulta as linhas do material 12967. Só mostre a tabela.");
+    await t.send("Consulte o cadastro da rota DS01 para DE01. Só mostre a tabela.");
     t.succeeded();
     t.calledTool("consultar-linha");
+    t.notCalledTool("preparar-solicitacao");
     t.notCalledTool("atender-solicitacao");
   },
 });

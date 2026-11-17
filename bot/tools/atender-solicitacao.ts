@@ -1,37 +1,44 @@
 import { prompt } from "@grok/agent-sdk";
 import { defineTool } from "@grok/agent-sdk/tools";
 import * as z from "zod/v4";
-import { applyLaneFlags, invalidId } from "../lib/ibp.js";
+import { gravarSolicitacao, type RouteInput } from "../lib/cadastro.js";
 
-const laneKey = z.object({
+const route = z.object({
   locfr: z.string().trim().min(1).max(20),
   locto: z.string().trim().min(1).max(20),
-  prdid: z.string().trim().min(1).max(40),
-  motid: z.string().trim().min(1).max(10),
-  addlaneid: z.string().trim().min(1).max(40),
+  motid: z.string().trim().min(1).max(10).optional(),
+  prdid: z.string().trim().min(1).max(40).optional(),
+  marca: z.string().trim().min(1).max(60).optional(),
+  submarca: z.string().trim().min(1).max(60).optional(),
+  classif: z.string().trim().min(1).max(20).optional(),
+  addlane: z.string().trim().min(1).max(20).optional(),
+  leadTime: z.number().int().min(0).max(999).optional(),
+  saida: z.number().int().min(0).max(999).optional(),
+  transito: z.number().int().min(0).max(999).optional(),
+  recebimento: z.number().int().min(0).max(999).optional(),
+  marcarExclusao: z.boolean().optional(),
 });
 
 export default defineTool({
   description: prompt`
     Atender a solicitação.
-    Grava no IBP o bloqueio para planejamento e a marca de exclusão das linhas escolhidas.
-    Bloquear marca os dois. Desbloquear limpa os dois.
-    A versão __BASELINE não aceita gravação. A gravação vai para a versão INPUTDADOS, o input manual. Se a linha ainda não existir lá, ela é criada.
-    Só executa depois que a pessoa clicar em aprovar.
+    Cria ou altera o cadastro na DRPZTLANEOBP, versão INPUTDADOS (input manual).
+    Bloquear marca TLANEBLOCKEDFORPLANNING. Desbloquear limpa esse campo.
+    A justificativa é gravada na observação.
+    Só executa depois que a pessoa clicar em aprovar. Use os mesmos argumentos da prévia.
   `,
   effect: "idempotent",
   needsApproval: true,
   inputSchema: z.object({
     acao: z.enum(["bloquear", "desbloquear"]),
-    lanes: z.array(laneKey).min(1).max(40),
+    justificativa: z.string().trim().min(5).max(500),
+    rotas: z.array(route).min(1).max(10),
   }),
   async execute(input, ctx) {
     if (ctx.session.purpose === "eval") {
-      return { ok: true, ibpChanged: false, changed: 0, status: "eval", lanes: [] };
+      return { ok: true, ibpChanged: false, changed: 0, status: "eval", rotas: [] };
     }
-    for (const lane of input.lanes) {
-      if (Object.values(lane).some(invalidId)) return { ok: false, error: "invalid_id" };
-    }
-    return applyLaneFlags(input.lanes, input.acao);
+    const rotas: RouteInput[] = input.rotas;
+    return gravarSolicitacao({ ...input, rotas });
   },
 });

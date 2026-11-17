@@ -1,13 +1,14 @@
 ---
-description: Use quando a pessoa informar materiais e pedir para ver, bloquear ou desbloquear linhas de transporte.
+description: Use quando a pessoa pedir para bloquear, desbloquear ou consultar uma rota de transporte.
 ---
 
-# Atender solicitação de lanes
+# Solicitação de bloqueio de lane
 
-1. Separe cada material informado. Não peça origem nem destino.
-2. Chame `consultar-linha` com `materiais`. Não descreva o resultado antes dessa resposta.
-3. Mostre a tabela com Origem, Destino, Material, Modo, Id, Bloqueio e Exclusão.
-4. Pergunte se a pessoa quer bloquear ou desbloquear, e quais linhas.
-5. Chame `atender-solicitacao` com a ação e as chaves completas. Diga para clicar em Approve para atender a solicitação.
-6. Se a aprovação for recusada, pare. O IBP não muda.
-7. Se a ferramenta concluir, mostre `atualizadas` com a coluna Versão. Diga que a gravação foi na versão INPUTDADOS, input manual. A tabela `lanes` é a __BASELINE e pode continuar igual.
+1. A justificativa é obrigatória. Sem ela, peça antes de continuar.
+2. Consulte `consultar-linha` quando a origem e o destino já puderem existir na DRPZTLANEOBP.
+3. Chame `preparar-solicitacao` com a ação, a justificativa e as rotas.
+4. Mostre a prévia em tabela, a operação criar ou alterar, e os avisos. A justificativa aparece como observação.
+5. Se `ready` for false, pergunte o que falta. Não chame `atender-solicitacao`.
+6. Com a prévia pronta, peça para clicar em Approve e chame `atender-solicitacao` com os mesmos argumentos.
+7. Se a aprovação for recusada, pare. O IBP não muda.
+8. Se a gravação concluir, mostre a prévia gravada. Diga que a baseline só muda com o job da Cadeia de Pré-Inicialização Diária.

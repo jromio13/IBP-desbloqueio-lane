@@ -67,7 +67,7 @@ export type IbpFailure = {
 const ID_PATTERN = /^[A-Za-z0-9._/-]+$/;
 const LIMIT = 40;
 
-type Config = {
+export type Config = {
   baseUrl: string;
   user: string;
   password: string;
@@ -372,7 +372,7 @@ async function postOnce(
   return { ok: true, job: { session, transactionId: session.transactionId } };
 }
 
-async function waitUntilProcessed(
+export async function waitUntilProcessed(
   config: Config,
   session: WriteSession,
   transactionId: string,
@@ -441,7 +441,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function odataQuote(value: string): string {
+export function odataQuote(value: string): string {
   return value.replaceAll("'", "''");
 }
 
@@ -462,7 +462,7 @@ function toLane(row: Record<string, unknown>): LaneRecord {
   };
 }
 
-function asString(value: unknown): string {
+export function asString(value: unknown): string {
   return typeof value === "string" ? value : value == null ? "" : String(value);
 }
 
@@ -483,7 +483,7 @@ function sapDate(value: unknown): string | null {
   return date.toISOString().slice(0, 10);
 }
 
-function odataRows(body: unknown): Record<string, unknown>[] {
+export function odataRows(body: unknown): Record<string, unknown>[] {
   if (body === null || typeof body !== "object") return [];
   const root = body as { d?: { results?: unknown } };
   const results = root.d?.results;
@@ -493,14 +493,14 @@ function odataRows(body: unknown): Record<string, unknown>[] {
   );
 }
 
-type WriteSession = {
+export type WriteSession = {
   ok: true;
   transactionId: string;
   csrf: string;
   cookie: string;
 };
 
-async function openWriteSession(config: Config): Promise<WriteSession | IbpFailure> {
+export async function openWriteSession(config: Config): Promise<WriteSession | IbpFailure> {
   const response = await ibpSend(
     config,
     `${config.baseUrl}/GetTransactionID?$format=json`,
@@ -521,15 +521,16 @@ function transactionValue(body: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-async function readMessages(
+export async function readMessages(
   config: Config,
   session: WriteSession,
   transactionId: string,
+  messageSet = "DRPTLANEMessage",
 ): Promise<string[]> {
   const filter = encodeURIComponent(`TransactionID eq '${odataQuote(transactionId)}'`);
   const response = await ibpSend(
     config,
-    `${config.baseUrl}/DRPTLANEMessage?$format=json&$filter=${filter}`,
+    `${config.baseUrl}/${messageSet}?$format=json&$filter=${filter}`,
     { method: "GET", csrf: session.csrf, cookie: session.cookie },
   );
   if (!response.ok) return [];
@@ -539,9 +540,10 @@ async function readMessages(
     .slice(0, 5);
 }
 
-type HttpOk = {
+export type HttpOk = {
   ok: true;
   body: unknown;
+  text: string;
   csrf?: string;
   cookie: string;
 };
@@ -550,17 +552,17 @@ async function ibpGet(config: Config, url: string): Promise<HttpOk | IbpFailure>
   return ibpSend(config, url, { method: "GET" });
 }
 
-async function ibpSend(
+export async function ibpSend(
   config: Config,
   url: string,
-  init: { method: "GET" | "POST"; body?: string; csrf?: string; cookie?: string },
+  init: { method: "GET" | "POST"; body?: string; csrf?: string; cookie?: string; accept?: string },
 ): Promise<HttpOk | IbpFailure> {
   const headers = new Headers();
   headers.set(
     "Authorization",
     `Basic ${Buffer.from(`${config.user}:${config.password}`).toString("base64")}`,
   );
-  headers.set("Accept", "application/json");
+  headers.set("Accept", init.accept ?? "application/json");
   if (init.body !== undefined) headers.set("Content-Type", "application/json");
   if (init.csrf !== undefined) headers.set("X-CSRF-Token", init.csrf);
   if (init.cookie !== undefined && init.cookie !== "") headers.set("Cookie", init.cookie);
@@ -585,7 +587,7 @@ async function ibpSend(
   }
   const csrf = response.headers.get("x-csrf-token") ?? undefined;
   const cookie = cookieHeader(response, init.cookie);
-  return { ok: true, body, csrf, cookie };
+  return { ok: true, body, text, csrf, cookie };
 }
 
 function parseJson(text: string): unknown {

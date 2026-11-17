@@ -4,13 +4,12 @@ export default slackChannel({
   envPrefix: "TRANSPORTE_DESBLOQUEIO",
   suggestedPrompts: [
     {
-      title: "Consultar linha",
-      message:
-        "Consulta a linha de transporte. Origem DS01, destino DE01, produto 12967, modo PAL, id B2B.",
+      title: "Consultar cadastro",
+      message: "Consulte o cadastro da rota com origem DS01 e destino DE01.",
     },
     {
-      title: "Pedir desbloqueio",
-      message: "Quero solicitar o desbloqueio dessa linha.",
+      title: "Pedir bloqueio",
+      message: "Quero bloquear a rota DS01 para DE01. Justificativa: rota temporariamente sem operação.",
     },
   ],
 });
