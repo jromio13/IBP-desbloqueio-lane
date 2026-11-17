@@ -276,25 +276,17 @@ export async function gravarSolicitacao(
     const built = await buildWrite(config, model, input, route);
     if ("error" in built) return built;
     if (built.skip) continue;
-    const session = await openWriteSession(config);
-    if (!session.ok) return session;
+    const missingKey = blankKey(built.item);
+    if (missingKey !== null) return { ok: false, error: "missing_key", detail: missingKey };
     const attributes = requestedAttributes(built.item);
-    const posted = await ibpSend(config, `${config.baseUrl}/${model.transSet}`, {
-      method: "POST",
-      csrf: session.csrf,
-      cookie: session.cookie,
-      body: JSON.stringify({
-        TransactionID: session.transactionId,
-        ...(model.sendPlanning ? { PlanningAreaID: config.planningArea } : {}),
-        ...(model.sendVersion ? { VersionID: INPUT_VERSION } : {}),
-        DoCommit: true,
-        DeleteEntries: false,
-        RequestedAttributes: attributes,
-        [model.nav]: [built.item],
-      }),
-    });
-    if (!posted.ok) return posted;
-    jobs.push({ session, transactionId: session.transactionId });
+    const posted = await postCadastro(config, model, built.item, attributes);
+    if (!posted.ok) {
+      return {
+        ...posted,
+        detail: `Enviados: ${attributes}. ${posted.detail ?? ""}`.slice(0, 300),
+      };
+    }
+    jobs.push({ session: posted.session, transactionId: posted.transactionId });
     changed += 1;
   }
 
@@ -482,7 +474,7 @@ async function buildWrite(
       },
     };
   }
-  for (const key of model.keys) {
+  for (const key of KEY_FIELDS) {
     if (draftValue(model, draft, key) === "") missing.push(key);
   }
   if (missing.length > 0) {
@@ -764,16 +756,30 @@ function itemFromDraft(model: Model, existing: RawRow | null, draft: Draft): Raw
   put(item, model, model.blocked, draft.blocked ? "X" : "");
   put(item, model, model.deletion, draft.markedForDeletion ? "X" : "");
   put(item, model, model.observacao, draft.justificativa);
-  item.LOCFR = draft.locfr;
-  item.LOCTO = draft.locto;
-  item.MOTID = draft.motid || "ALL";
-  item.PRDID = draft.prdid || "ALL";
-  item.ZMARCA = draft.marca || "ALL";
-  item.ZSUBMARCA = draft.submarca || "ALL";
-  item.ZOBPCLASSIFDRP = draft.classif || "ALL";
-  item.ZIDADDLANE = draft.addlane;
   if (model.rounding !== null) delete item[model.rounding];
+  return applyRequiredKeys(item, draft);
+}
+
+export function applyRequiredKeys(item: RawRow, draft: Draft): RawRow {
+  item.ZOBPCLASSIFDRP = textOr(draft.classif, "ALL");
+  item.ZIDADDLANE = draft.addlane.trim();
+  item.ZMARCA = textOr(draft.marca, "ALL");
+  item.MOTID = textOr(draft.motid, "ALL");
+  item.PRDID = textOr(draft.prdid, "ALL");
+  item.LOCTO = draft.locto.trim();
+  item.LOCFR = draft.locfr.trim();
+  item.ZSUBMARCA = textOr(draft.submarca, "ALL");
   return item;
+}
+
+function textOr(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  return trimmed === "" ? fallback : trimmed;
+}
+
+function blankKey(item: RawRow): string | null {
+  const missing = KEY_FIELDS.filter((name) => asString(item[name]).trim() === "");
+  return missing.length === 0 ? null : missing.join(", ");
 }
 
 function fillKeyDefaults(draft: Draft): void {
@@ -784,10 +790,44 @@ function fillKeyDefaults(draft: Draft): void {
   if (draft.classif === "") draft.classif = "ALL";
 }
 
-function requestedAttributes(item: RawRow): string {
-  const keys = KEY_FIELDS.filter((name) => name in item);
+export function requestedAttributes(item: RawRow): string {
   const rest = Object.keys(item).filter((name) => !KEY_FIELD_SET.has(name));
-  return [...keys, ...rest].join(",");
+  return [...KEY_FIELDS, ...rest].join(",");
+}
+
+async function postCadastro(
+  config: Config,
+  model: Model,
+  item: RawRow,
+  attributes: string,
+): Promise<{ ok: true; session: WriteSession; transactionId: string } | IbpFailure> {
+  const shapes: Array<Record<string, unknown>> = [
+    { [model.nav]: [item] },
+    { [model.nav]: { results: [item] } },
+  ];
+  let last: IbpFailure | null = null;
+  for (const shape of shapes) {
+    const session = await openWriteSession(config);
+    if (!session.ok) return session;
+    const posted = await ibpSend(config, `${config.baseUrl}/${model.transSet}`, {
+      method: "POST",
+      csrf: session.csrf,
+      cookie: session.cookie,
+      body: JSON.stringify({
+        TransactionID: session.transactionId,
+        ...(model.sendPlanning ? { PlanningAreaID: config.planningArea } : {}),
+        ...(model.sendVersion ? { VersionID: INPUT_VERSION } : {}),
+        DoCommit: true,
+        DeleteEntries: false,
+        RequestedAttributes: attributes,
+        ...shape,
+      }),
+    });
+    if (posted.ok) return { ok: true, session, transactionId: session.transactionId };
+    last = posted;
+    if (!/key and required/i.test(posted.detail ?? "")) return posted;
+  }
+  return last ?? { ok: false, error: "ibp_http_error" };
 }
 
 function put(item: RawRow, model: Model, name: string | null, value: string | number): void {
@@ -827,7 +867,7 @@ function draftValue(model: Model, draft: Draft, key: string): string {
   if (key === model.submarca) return draft.submarca;
   if (key === model.classif) return draft.classif;
   if (key === model.addlane) return draft.addlane;
-  return "ok";
+  return "";
 }
 
 function assignFilter(filters: Record<string, string>, attribute: string | null, value: string): void {
@@ -929,7 +969,7 @@ async function readModel(config: Config): Promise<Model | IbpFailure> {
   for (const name of KEY_FIELDS) {
     if (!writeProps.has(name)) writeProps.set(name, { name, type: "Edm.String", nullable: false });
   }
-  const nav = trans.match(/<NavigationProperty Name="([^"]+)"/)?.[1] ?? "";
+  const nav = navigationName(trans);
   const observacao = observationAttribute([...writeProps.values()]);
   if (nav === "" || observacao === null) {
     const candidates = [...writeProps.values()]
@@ -1023,14 +1063,26 @@ function entitySetName(xml: string, typeName: string): string | null {
 
 function readProps(xml: string): Prop[] {
   const props: Prop[] = [];
-  for (const match of xml.matchAll(/<Property Name="([^"]+)" Type="([^"]+)"([^/>]*)\/>/g)) {
-    props.push({
-      name: match[1] ?? "",
-      type: match[2] ?? "",
-      nullable: !match[3]?.includes('Nullable="false"'),
-    });
+  for (const match of xml.matchAll(/<Property\b([^>]*?)\/>/g)) {
+    const tag = match[1] ?? "";
+    const name = /Name="([^"]+)"/.exec(tag)?.[1];
+    const type = /Type="([^"]+)"/.exec(tag)?.[1];
+    if (name === undefined || type === undefined) continue;
+    props.push({ name, type, nullable: !tag.includes('Nullable="false"') });
   }
   return props;
+}
+
+function navigationName(xml: string): string {
+  const names = [...xml.matchAll(/<NavigationProperty\b([^>]*?)\/>/g)]
+    .map((match) => /Name="([^"]+)"/.exec(match[1] ?? "")?.[1] ?? "")
+    .filter((name) => name !== "");
+  return (
+    names.find((name) => name.includes(CADASTRO_ENTITY) && !name.includes("Message")) ??
+    names.find((name) => !name.includes("Message")) ??
+    names[0] ??
+    ""
+  );
 }
 
 function readKeys(xml: string): string[] {
